@@ -27,6 +27,7 @@ class StatusManager: ObservableObject {
     
     @Published var isClientRunning: Bool = false
     @Published var isClientLaunchedByApp: Bool = false
+    @Published var chatTLSFailed = false
     
     private var chatProxy: ChatProxy?
     private let logger = Logger(label: "NoChat4U.StatusManager")
@@ -41,6 +42,12 @@ class StatusManager: ObservableObject {
         let persistedStatus = SharedState.shared.targetStatus
         isOffline = persistedStatus == "offline"
         logger.info("Loaded persisted status", metadata: ["status": .string(persistedStatus)])
+        
+        // The chat proxy reports whether Riot's chat server passed the TLS check.
+        NotificationCenter.default.addObserver(forName: Notification.Name("ChatTLSStatus"), object: nil, queue: .main) { [weak self] note in
+            let ok = note.userInfo?["ok"] as? Bool ?? true
+            MainActor.assumeIsolated { self?.chatTLSFailed = !ok }
+        }
         
         Task {
             var env = try Environment.detect()
@@ -109,6 +116,9 @@ class StatusManager: ObservableObject {
         if status.isRunning != isClientRunning || status.launchedByApp != isClientLaunchedByApp {
             isClientRunning = status.isRunning
             isClientLaunchedByApp = status.launchedByApp
+            if !status.isRunning {
+                chatTLSFailed = false
+            }
             
             logger.info(
                 "Riot client status changed",

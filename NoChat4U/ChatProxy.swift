@@ -130,7 +130,7 @@ final class ChatProxy {
             }
         
         return bootstrap.connect(host: host, port: port).map { serverChannel in
-            logger.info("Connected to Riot chat server")
+            logger.info("TCP connected to Riot chat server, starting TLS")
             connection.serverChannel = serverChannel
             
             serverChannel.closeFuture.whenComplete { _ in
@@ -270,6 +270,11 @@ final class ProxiedConnection {
     }
 }
 
+/// Tells StatusManager whether Riot's chat server passed the TLS check.
+private func postChatTLSStatus(ok: Bool) {
+    NotificationCenter.default.post(name: Notification.Name("ChatTLSStatus"), object: nil, userInfo: ["ok": ok])
+}
+
 /// Modifies presence XML to change the status if needed
 private func modifyPresenceXML(_ xml: String, targetStatus: String) -> String {
     guard targetStatus == "offline" else {
@@ -356,6 +361,7 @@ final class ServerToClientHandler: ChannelInboundHandler {
     typealias OutboundOut = ByteBuffer
     
     private let connection: ProxiedConnection
+    private var tlsStatusReported = false
     
     init(connection: ProxiedConnection) {
         self.connection = connection
@@ -363,6 +369,11 @@ final class ServerToClientHandler: ChannelInboundHandler {
     
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let buffer = unwrapInboundIn(data)
+        if !tlsStatusReported {
+            // First data from Riot: the TLS handshake passed.
+            tlsStatusReported = true
+            postChatTLSStatus(ok: true)
+        }
         
         connection.forwardToClient(buffer).whenFailure { [weak context] error in
             logger.error("Error forwarding server data: \(error)")
@@ -380,6 +391,9 @@ final class ServerToClientHandler: ChannelInboundHandler {
         if let sslError = error as? NIOSSLError,
            case .uncleanShutdown = sslError {
             return
+        }
+        if let sslError = error as? NIOSSLError, case .handshakeFailed = sslError {
+            postChatTLSStatus(ok: false)
         }
         
         context.eventLoop.execute {
