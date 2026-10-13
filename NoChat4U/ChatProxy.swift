@@ -83,8 +83,9 @@ final class ChatProxy {
                     }
                 }
                 
-                let sslHandler = NIOSSLServerHandler(context: self.serverSSLContext)
-                return channel.pipeline.addHandler(sslHandler).flatMap { _ in
+                return channel.eventLoop.makeCompletedFuture {
+                    try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: self.serverSSLContext))
+                }.flatMap { _ in
                     return self.connectToServer(connection: connection).flatMap { serverChannel in
                         logger.debug("Successfully connected to server, adding client handler")
                         return channel.pipeline.addHandler(ClientToServerHandler(connection: connection))
@@ -119,7 +120,7 @@ final class ChatProxy {
         
         logger.info("Connecting to server \(host):\(port)")
         
-        let sslContext: NIOSSLContext?
+        let sslContext: NIOSSLContext
         
         var sslConfig = TLSConfiguration.makeClientConfiguration()
         sslConfig.certificateVerification = .fullVerification
@@ -133,26 +134,15 @@ final class ChatProxy {
             return connection.clientChannel.eventLoop.makeFailedFuture(error)
         }
         
-        let bootstrap = ClientBootstrap(group: group)
+        // Same event loop as the client channel: both directions of a
+        // connection run on one thread, so its state needs no locking.
+        let bootstrap = ClientBootstrap(group: connection.clientChannel.eventLoop)
             .channelOption(ChannelOptions.connectTimeout, value: .seconds(10))
             .channelInitializer { channel in
-                logger.debug("Initializing channel to server")
-                
-                if let sslContext = sslContext {
-                    do {
-                        let sslHandler = try NIOSSLClientHandler(
-                            context: sslContext,
-                            serverHostname: host
-                        )
-                        return channel.pipeline.addHandler(sslHandler).flatMap {
-                            logger.debug("SSL handler added, adding server-to-client handler")
-                            return channel.pipeline.addHandler(ServerToClientHandler(connection: connection))
-                        }
-                    } catch {
-                        return channel.eventLoop.makeFailedFuture(error)
-                    }
-                } else {
-                    return channel.pipeline.addHandler(ServerToClientHandler(connection: connection))
+                channel.eventLoop.makeCompletedFuture {
+                    let sync = channel.pipeline.syncOperations
+                    try sync.addHandler(NIOSSLClientHandler(context: sslContext, serverHostname: host))
+                    try sync.addHandler(ServerToClientHandler(connection: connection))
                 }
             }
         
@@ -169,15 +159,10 @@ final class ChatProxy {
         }
     }
     
+    /// Closes every channel, the listening one included, without blocking.
     func stop() {
         logger.info("Stopping chat proxy")
-        connectionsLock.withLock {
-            for (_, connection) in connections {
-                connection.clientChannel.close(promise: nil)
-                connection.serverChannel?.close(promise: nil)
-            }
-            connections.removeAll()
-        }
+        group.shutdownGracefully { _ in }
     }
 }
 
