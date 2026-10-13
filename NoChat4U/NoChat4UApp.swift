@@ -3,9 +3,7 @@ import AppKit
 
 public class AppDelegate: NSObject, NSApplicationDelegate {
     public func applicationWillTerminate(_ notification: Notification) {
-        Task {
-            await terminateLeagueClient()
-        }
+        terminateLeagueClient()
     }
 }
 

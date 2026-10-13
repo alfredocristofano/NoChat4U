@@ -4,8 +4,8 @@ import Foundation
 private let riotClientInstallsPath = "/Users/Shared/Riot Games/RiotClientInstalls.json"
 // Track if the client was launched by our app
 private var clientLaunchedByApp = false
-// Track the PID of the client process launched by our app
-private var launchedClientPID: Int32? = nil
+// The client process launched by our app (kept to signal it only while it runs)
+private var launchedClient: Process?
 
 struct RiotClientInstalls: Codable {
     let associated_client: [String: String]
@@ -28,6 +28,8 @@ public struct ClientStatus {
     let launchedByApp: Bool
 }
 
+// Main actor: the launch flags above are only read and written there.
+@MainActor
 public func isRiotClientRunning() async -> ClientStatus {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
@@ -70,37 +72,24 @@ public func launchLeagueClient(proxyHost: String, proxyPort: UInt16) throws {
     try process.run()
     
     clientLaunchedByApp = true
-    launchedClientPID = process.processIdentifier
+    launchedClient = process
 }
 
 public func resetClientLaunchedFlag() {
     clientLaunchedByApp = false
-    launchedClientPID = nil
+    launchedClient = nil
 }
 
-// Terminate the launched client process
-public func terminateLeagueClient() async {
-    if clientLaunchedByApp, let pid = launchedClientPID {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/kill")
-        process.arguments = ["\(pid)"]
-
-        do {
-            try process.run()
-            await withCheckedContinuation { continuation in
-                process.terminationHandler = { _ in
-                    continuation.resume()
-                }
-            }
-            print("Attempted to terminate client process with PID \(pid)")
-        } catch {
-            print("Error attempting to terminate client process \(pid): \(error)")
-        }
-
-        resetClientLaunchedFlag()
-    } else {
-        print("No client process launched by the app to terminate.")
+// Terminate the launched client process. Synchronous on purpose: it runs
+// during app termination, when async work never gets scheduled.
+public func terminateLeagueClient() {
+    guard clientLaunchedByApp, let client = launchedClient, client.isRunning else {
+        print("No running client process launched by the app to terminate.")
+        return
     }
+    client.terminate()
+    print("Sent SIGTERM to client process with PID \(client.processIdentifier)")
+    resetClientLaunchedFlag()
 }
 
 enum LeagueClientError: Error {
