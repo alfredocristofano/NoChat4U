@@ -1,5 +1,6 @@
 import Foundation
 import Logging
+import os
 
 /// Calls the local Riot/League APIs to sync the client-side chat status
 /// with what NoChat4U shows other users, eliminating the visual mismatch
@@ -8,170 +9,91 @@ import Logging
 enum RiotClientAPI {
     private static let logger = Logger(label: "NoChat4U.RiotClientAPI")
     private static let maxAttempts = 5
-    private static let generationLock = NSLock()
-    private static var generation = 0
+    private static let currentSync = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
 
     // MARK: - Lockfile
 
-    /// Static fallback locations. Runtime discovery handles custom installs.
-    private static let riotLockfileCandidates: [String] = {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return [
-            home.appendingPathComponent("Library/Application Support/Riot Games/Riot Client/Config/lockfile").path
-        ]
-    }()
+    /// Static fallback location. Runtime discovery handles custom installs.
+    private static let staticLeagueLockfile = "/Applications/League of Legends.app/Contents/LoL/lockfile"
 
-    private static let staticLeagueLockfileCandidates = [
-        "/Applications/League of Legends.app/Contents/LoL/lockfile"
-    ]
+    private static let riotLockfile = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Riot Games/Riot Client/Config/lockfile").path
 
-    /// Parsed lockfile content.
-    private struct Lockfile: Sendable {
-        let path: String
+    /// Parsed lockfile content: `name:pid:port:password:protocol`.
+    private struct Lockfile {
         let name: String
-        let pid: Int
         let port: Int
         let password: String
-        let proto: String
 
-        init?(path: String, line: String) {
+        init?(line: String) {
             let parts = line.split(separator: ":", omittingEmptySubsequences: false)
-            guard parts.count == 5,
-                  let pid = Int(parts[1]),
-                  let port = Int(parts[2]) else { return nil }
-            self.path = path
+            guard parts.count == 5, let port = Int(parts[2]) else { return nil }
             self.name = String(parts[0])
-            self.pid = pid
             self.port = port
             self.password = String(parts[3])
-            self.proto = String(parts[4])
         }
     }
 
-    private enum LocalChatAPI: Sendable {
-        case leagueClient
-        case riotClient
-
-        var endpoint: String {
-            switch self {
-            case .leagueClient:
-                return "/lol-chat/v1/me"
-            case .riotClient:
-                return "/chat/v3/me"
-            }
-        }
-
-        func body(for state: String) -> [String: String] {
-            switch self {
-            case .leagueClient:
-                return ["availability": state]
-            case .riotClient:
-                return ["state": state]
-            }
-        }
-    }
-
-    private struct SyncTarget: Sendable {
-        let api: LocalChatAPI
+    /// League Client API first (`availability`), Riot Client API as fallback (`state`).
+    private struct SyncTarget {
+        let endpoint: String
+        let bodyKey: String
         let lockfile: Lockfile
     }
 
     // MARK: - Public API
 
     /// Updates the chat state the League client displays to the user.
+    /// Best effort with retry, never blocks the caller. A newer call cancels
+    /// the previous one, so a stale retry cannot overwrite a newer toggle.
     ///
     /// - Parameter state: Currently `"chat"` or `"offline"`.
     static func updateState(_ state: String) {
-        let generation = nextGeneration()
-        Task {
-            await syncState(state, attempt: 1, generation: generation)
-        }
-    }
-
-    /// Best-effort call with retry. Fires a Task so callers never block.
-    static func updateState(_ state: String, afterDelay seconds: Double) {
-        let generation = nextGeneration()
-        Task {
-            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            await syncState(state, attempt: 1, generation: generation)
+        currentSync.withLock { current in
+            current?.cancel()
+            current = Task.detached { await syncState(state) }
         }
     }
 
     // MARK: - Internal
 
-    private static func syncState(_ state: String, attempt: Int, generation: Int) async {
-        guard isCurrentGeneration(generation) else { return }
-
-        guard attempt <= maxAttempts else {
-            logger.warning("Giving up after \(maxAttempts) client-side status sync attempts")
-            return
-        }
-
-        let targets = findSyncTargets()
-        guard !targets.isEmpty else {
-            logger.debug("No Riot/League lockfile found; retrying client-side status sync")
-            await retry(state, attempt: attempt, generation: generation)
-            return
-        }
-
-        for target in targets {
-            guard isCurrentGeneration(generation) else { return }
-            if await putState(state, target: target, attempt: attempt) {
-                return
+    private static func syncState(_ state: String) async {
+        for attempt in 1...maxAttempts {
+            if attempt > 1 {
+                try? await Task.sleep(nanoseconds: UInt64(attempt - 1) * 2_000_000_000) // 2, 4, 6, 8 s
             }
+            for target in findSyncTargets() {
+                guard !Task.isCancelled else { return }
+                if await putState(state, target: target, attempt: attempt) { return }
+            }
+            guard !Task.isCancelled else { return }
         }
-
-        await retry(state, attempt: attempt, generation: generation)
-    }
-
-    private static func retry(_ state: String, attempt: Int, generation: Int) async {
-        let delay = min(Double(attempt) * 2.0, 10.0)
-        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-        await syncState(state, attempt: attempt + 1, generation: generation)
+        logger.warning("Giving up after \(maxAttempts) client-side status sync attempts")
     }
 
     private static func findSyncTargets() -> [SyncTarget] {
-        var targets: [SyncTarget] = []
+        var seen = Set<String>()
+        let leaguePaths = ([staticLeagueLockfile] + runningLeagueLockfilePaths()).filter { seen.insert($0).inserted }
 
-        for lockfile in readLockfiles(from: leagueLockfileCandidates()) {
-            targets.append(SyncTarget(api: .leagueClient, lockfile: lockfile))
+        var targets = leaguePaths.compactMap(readLockfile).map {
+            SyncTarget(endpoint: "/lol-chat/v1/me", bodyKey: "availability", lockfile: $0)
         }
-
-        for lockfile in readLockfiles(from: riotLockfileCandidates) {
-            targets.append(SyncTarget(api: .riotClient, lockfile: lockfile))
+        if let riot = readLockfile(riotLockfile) {
+            targets.append(SyncTarget(endpoint: "/chat/v3/me", bodyKey: "state", lockfile: riot))
         }
-
-        return targets.reduce(into: [SyncTarget]()) { unique, target in
-            let alreadyAdded = unique.contains {
-                $0.api.endpoint == target.api.endpoint &&
-                $0.lockfile.port == target.lockfile.port
-            }
-            if !alreadyAdded {
-                unique.append(target)
-            }
-        }
+        return targets
     }
 
-    private static func leagueLockfileCandidates() -> [String] {
-        unique(staticLeagueLockfileCandidates + runningLeagueLockfilePaths())
-    }
-
-    private static func readLockfiles(from paths: [String]) -> [Lockfile] {
-        paths.compactMap { path in
-            guard FileManager.default.fileExists(atPath: path) else { return nil }
-            guard let content = try? String(contentsOfFile: path, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !content.isEmpty else { return nil }
-
-            if let lockfile = Lockfile(path: path, line: content) {
-                logger.debug(
-                    "Found \(lockfile.name) lockfile",
-                    metadata: ["port": .string("\(lockfile.port)")]
-                )
-                return lockfile
-            }
+    private static func readLockfile(_ path: String) -> Lockfile? {
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8),
+              let lockfile = Lockfile(line: content.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             return nil
         }
+        logger.debug(
+            "Found \(lockfile.name) lockfile",
+            metadata: ["port": .string("\(lockfile.port)")]
+        )
+        return lockfile
     }
 
     private static func runningLeagueLockfilePaths() -> [String] {
@@ -183,14 +105,14 @@ enum RiotClientAPI {
         }
 
         let marker = "League of Legends.app/Contents/LoL"
-        return unique(output.components(separatedBy: .newlines).compactMap { line in
+        return output.components(separatedBy: .newlines).compactMap { line in
             guard line.contains("LeagueClient"),
                   let range = line.range(of: marker) else { return nil }
 
             let installRoot = String(line[..<range.upperBound])
             guard installRoot.hasPrefix("/") else { return nil }
             return installRoot + "/lockfile"
-        })
+        }
     }
 
     private static func putState(
@@ -199,7 +121,7 @@ enum RiotClientAPI {
         attempt: Int
     ) async -> Bool {
         let lockfile = target.lockfile
-        let url = URL(string: "https://127.0.0.1:\(lockfile.port)\(target.api.endpoint)")!
+        let url = URL(string: "https://127.0.0.1:\(lockfile.port)\(target.endpoint)")!
 
         var request = URLRequest(url: url, timeoutInterval: 3)
         request.httpMethod = "PUT"
@@ -210,8 +132,7 @@ enum RiotClientAPI {
         let authData = Data(authString.utf8).base64EncodedString()
         request.setValue("Basic \(authData)", forHTTPHeaderField: "Authorization")
 
-        let body = target.api.body(for: state)
-        request.httpBody = try? JSONEncoder().encode(body)
+        request.httpBody = try? JSONEncoder().encode([target.bodyKey: state])
 
         // Self-signed certificate — accept any server trust.
         let session = URLSession(
@@ -223,17 +144,16 @@ enum RiotClientAPI {
 
         do {
             let (data, response) = try await session.data(for: request)
-            let httpResponse = response as? HTTPURLResponse
-            let statusCode = httpResponse?.statusCode ?? 0
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             logger.info(
-                "PUT \(target.api.endpoint) → \(statusCode)",
+                "PUT \(target.endpoint) → \(statusCode)",
                 metadata: [
                     "attempt": .string("\(attempt)"),
                     "lockfile": .string(lockfile.name)
                 ]
             )
 
-            if statusCode == 200 || statusCode == 201 || statusCode == 204 {
+            if (200..<300).contains(statusCode) {
                 logger.info("Client-side chat state synced to \(state)")
                 return true
             }
@@ -242,13 +162,13 @@ enum RiotClientAPI {
                 "Client-side chat state sync rejected",
                 metadata: [
                     "status": .string("\(statusCode)"),
-                    "body": .string(compactBody(data))
+                    "body": .string(String(decoding: data.prefix(300), as: UTF8.self))
                 ]
             )
             return false
         } catch {
             logger.warning(
-                "PUT \(target.api.endpoint) failed",
+                "PUT \(target.endpoint) failed",
                 metadata: [
                     "attempt": .string("\(attempt)"),
                     "error": .string(error.localizedDescription)
@@ -262,50 +182,25 @@ enum RiotClientAPI {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        // Apps started from Finder or at login have no LANG; without a UTF-8
+        // locale ps escapes non-ASCII path characters ("è" -> "M-CM-(").
+        process.environment = ["LC_ALL": "en_US.UTF-8"]
 
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        process.standardError = FileHandle.nullDevice
 
         do {
             try process.run()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             guard process.terminationStatus == 0 else { return nil }
-            return String(data: data, encoding: .utf8)
+            // Lenient: one process with non-UTF-8 arguments must not hide the others.
+            return String(decoding: data, as: UTF8.self)
         } catch {
             logger.debug("Failed to run process \(executable): \(error.localizedDescription)")
             return nil
         }
-    }
-
-    private static func unique(_ paths: [String]) -> [String] {
-        var seen = Set<String>()
-        return paths.filter { path in
-            guard !seen.contains(path) else { return false }
-            seen.insert(path)
-            return true
-        }
-    }
-
-    private static func compactBody(_ data: Data) -> String {
-        guard let string = String(data: data, encoding: .utf8) else {
-            return "<non-utf8 body>"
-        }
-        return String(string.prefix(300))
-    }
-
-    private static func nextGeneration() -> Int {
-        generationLock.lock()
-        defer { generationLock.unlock() }
-        generation += 1
-        return generation
-    }
-
-    private static func isCurrentGeneration(_ value: Int) -> Bool {
-        generationLock.lock()
-        defer { generationLock.unlock() }
-        return generation == value
     }
 }
 
