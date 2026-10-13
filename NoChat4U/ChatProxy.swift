@@ -39,25 +39,8 @@ final class ChatProxy {
     }
     
     private func sendUpdatedPresence() {
-        guard let lastPresence = SharedState.shared.getLastPresence() else { return }
-        
-        let connection: ProxiedConnection? = connectionsLock.withLock {
-            connections.values.first
-        }
-        
-        guard let conn = connection, let serverChannel = conn.serverChannel else { return }
-        
-        let targetStatus = SharedState.shared.targetStatus
-        let modifiedStanza = modifyPresenceXML(lastPresence, targetStatus: targetStatus)
-        
-        logger.debug("Sending modified presence stanza: \(modifiedStanza)")
-        
-        var presenceBuffer = ByteBuffer()
-        presenceBuffer.writeString(modifiedStanza)
-        
-        serverChannel.eventLoop.execute {
-            serverChannel.writeAndFlush(presenceBuffer, promise: nil)
-        }
+        let all = connectionsLock.withLock { Array(connections.values) }
+        all.forEach { $0.resendLastPresence() }
     }
     
     func start() throws {
@@ -174,7 +157,11 @@ enum ChatProxyError: Error {
 final class ProxiedConnection {
     let clientChannel: Channel
     private let eventLoop: EventLoop
-    private var xmlBufferToServer = ""
+    // Touched only on eventLoop, which the client and server channels share.
+    private var pendingToServer: [UInt8] = []
+    private var lastPresence: String?
+    private static let presenceOpen = Array("<presence".utf8)
+    private static let presenceClose = Array("</presence>".utf8)
     private let serverChannelLock = NIOLock()
     private var _serverChannel: Channel?
     
@@ -188,66 +175,78 @@ final class ProxiedConnection {
         self.eventLoop = eventLoop
     }
     
-    /// Forward data from client to server with presence XML modification if needed
+    /// Forward data from client to server, rewriting presence stanzas if needed.
+    /// Bytes from an unfinished `<presence` on wait for the rest of the stanza,
+    /// so a presence split across reads is never forwarded unmodified.
     func processClientData(_ data: ByteBuffer) -> EventLoopFuture<Void> {
+        eventLoop.assertInEventLoop()
         guard let serverChannel = serverChannel else {
             return eventLoop.makeFailedFuture(ChannelError.ioOnClosedChannel)
         }
+        pendingToServer.append(contentsOf: data.readableBytesView)
         
-        if !eventLoop.inEventLoop {
-            return eventLoop.submit {
-                self.processClientData(data)
-            }.flatMap { $0 }
-        }
-        
-        let string = data.getString(at: data.readerIndex, length: data.readableBytes) ?? ""
-        logger.debug("Client data: \(string)")
-        
-        xmlBufferToServer += string
-        
-        if xmlBufferToServer.contains("<presence") && xmlBufferToServer.contains("</presence>") {
-            if let presenceStartRange = xmlBufferToServer.range(of: "<presence"),
-               let presenceEndRange = xmlBufferToServer.range(of: "</presence>") {
-                let stanzaEndIndex = presenceEndRange.upperBound
-                let presenceStanza = String(xmlBufferToServer[presenceStartRange.lowerBound..<stanzaEndIndex])
-                
-                if !presenceStanza.contains("to='") {
-                    SharedState.shared.storeLastPresence(presenceStanza)
-                }
-                
-                let beforeStanza = presenceStartRange.lowerBound > xmlBufferToServer.startIndex ?
-                    String(xmlBufferToServer[..<presenceStartRange.lowerBound]) : ""
-                let afterStanza = stanzaEndIndex < xmlBufferToServer.endIndex ?
-                    String(xmlBufferToServer[stanzaEndIndex...]) : ""
-                xmlBufferToServer = beforeStanza + afterStanza
-                
-                let targetStatus = SharedState.shared.targetStatus
-                let modifiedStanza = modifyPresenceXML(presenceStanza, targetStatus: targetStatus)
-                
-                logger.debug("Modified presence stanza: \(modifiedStanza)")
-                
-                var presenceBuffer = ByteBuffer()
-                presenceBuffer.writeString(modifiedStanza)
-                
-                return serverChannel.eventLoop.submit {
-                    serverChannel.writeAndFlush(presenceBuffer)
-                }.flatMap { $0 }.flatMap {
-                    if !self.xmlBufferToServer.isEmpty {
-                        return self.processClientData(ByteBuffer())
-                    } else {
-                        return self.eventLoop.makeSucceededFuture(())
-                    }
-                }
+        var out = ByteBuffer()
+        var start = 0
+        while true {
+            guard let open = pendingToServer[start...].firstRange(of: Self.presenceOpen) else {
+                // Forward all but a tail that may be the beginning of "<presence".
+                let end = pendingToServer.count - Self.partialPrefixLength(pendingToServer[start...])
+                out.writeBytes(pendingToServer[start..<end])
+                start = end
+                break
             }
+            out.writeBytes(pendingToServer[start..<open.lowerBound])
+            start = open.lowerBound
+            guard let end = Self.stanzaEnd(in: pendingToServer, after: open.upperBound) else { break }
+            
+            let stanza = String(decoding: pendingToServer[start..<end], as: UTF8.self)
+            start = end
+            if !stanza.contains("to='") {
+                handleClientPresence(stanza)
+            }
+            let modifiedStanza = modifyPresenceXML(stanza, targetStatus: SharedState.shared.targetStatus)
+            logger.debug("Modified presence stanza: \(modifiedStanza)")
+            out.writeString(modifiedStanza)
         }
+        pendingToServer.removeFirst(start)
         
-        var buffer = ByteBuffer()
-        buffer.writeString(xmlBufferToServer)
-        xmlBufferToServer = ""
-        
-        return serverChannel.eventLoop.submit {
-            serverChannel.writeAndFlush(buffer)
-        }.flatMap { $0 }
+        guard out.readableBytes > 0 else { return eventLoop.makeSucceededVoidFuture() }
+        return serverChannel.writeAndFlush(out)
+    }
+    
+    /// Re-sends this connection's last presence for the current target status.
+    func resendLastPresence() {
+        eventLoop.execute {
+            guard let presence = self.lastPresence, let serverChannel = self.serverChannel else { return }
+            let modifiedStanza = modifyPresenceXML(presence, targetStatus: SharedState.shared.targetStatus)
+            serverChannel.writeAndFlush(ByteBuffer(string: modifiedStanza), promise: nil)
+        }
+    }
+    
+    /// Remembers the client's own availability presence. Offline and unavailable
+    /// ones are skipped: re-sending them after going back online would hide the user.
+    private func handleClientPresence(_ stanza: String) {
+        guard !stanza.contains("<show>offline</show>"), !stanza.contains("type='unavailable'") else { return }
+        lastPresence = stanza
+    }
+    
+    /// Index just past the presence whose `<presence` name ends at `nameEnd`,
+    /// or nil while the stanza is still incomplete.
+    private static func stanzaEnd(in bytes: [UInt8], after nameEnd: Int) -> Int? {
+        guard let tagEnd = bytes[nameEnd...].firstIndex(of: UInt8(ascii: ">")) else { return nil }
+        if bytes[tagEnd - 1] == UInt8(ascii: "/") {
+            return tagEnd + 1 // self-closing <presence ... />
+        }
+        return bytes[(tagEnd + 1)...].firstRange(of: presenceClose)?.upperBound
+    }
+    
+    /// Length of the longest tail of `bytes` that is a proper prefix of "<presence".
+    private static func partialPrefixLength(_ bytes: ArraySlice<UInt8>) -> Int {
+        for length in stride(from: min(presenceOpen.count - 1, bytes.count), to: 0, by: -1)
+        where bytes.suffix(length).elementsEqual(presenceOpen.prefix(length)) {
+            return length
+        }
+        return 0
     }
     
     /// Forward data from server to client (no modifications needed)

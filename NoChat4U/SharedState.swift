@@ -9,12 +9,10 @@ final class SharedState {
     private var _originalChatHost: String?
     private var _originalChatPort: Int?
     private var _chatProxyPort: Int?
-    private var _lastPresenceXML: String?
     
     var originalChatHost: String? { lock.withLock { _originalChatHost } }
     var originalChatPort: Int?    { lock.withLock { _originalChatPort } }
     var chatProxyPort: Int?       { lock.withLock { _chatProxyPort } }
-    var lastPresenceXML: String?  { lock.withLock { _lastPresenceXML } }
     
     private init() {}
     
@@ -39,13 +37,5 @@ final class SharedState {
     
     func setTargetStatus(_ status: String) {
         targetStatus = status
-    }
-    
-    func storeLastPresence(_ xml: String) {
-        lock.withLock { _lastPresenceXML = xml }
-    }
-    
-    func getLastPresence() -> String? {
-        lock.withLock { _lastPresenceXML }
     }
 }
