@@ -160,6 +160,7 @@ final class ProxiedConnection {
     // Touched only on eventLoop, which the client and server channels share.
     private var pendingToServer: [UInt8] = []
     private var lastPresence: String?
+    private var clientStateChecked = false
     private static let presenceOpen = Array("<presence".utf8)
     private static let presenceClose = Array("</presence>".utf8)
     private let serverChannelLock = NIOLock()
@@ -223,10 +224,22 @@ final class ProxiedConnection {
         }
     }
     
-    /// Remembers the client's own availability presence. Offline and unavailable
-    /// ones are skipped: re-sending them after going back online would hide the user.
+    /// Handles the client's own broadcast presence.
     private func handleClientPresence(_ stanza: String) {
-        guard !stanza.contains("<show>offline</show>"), !stanza.contains("type='unavailable'") else { return }
+        let showsOffline = stanza.contains("<show>offline</show>")
+        // First presence: the chat is up, so is the client's local API. Align
+        // the state the client shows with NoChat4U's (issue #3), whenever the
+        // user logs in, and also when the client restored an old offline state.
+        if !clientStateChecked {
+            clientStateChecked = true
+            let target = SharedState.shared.targetStatus
+            if showsOffline != (target == "offline") {
+                RiotClientAPI.updateState(target)
+            }
+        }
+        // Remember it for re-sending, unless offline or unavailable: re-sending
+        // those after going back online would keep the user hidden.
+        guard !showsOffline, !stanza.contains("type='unavailable'") else { return }
         lastPresence = stanza
     }
     

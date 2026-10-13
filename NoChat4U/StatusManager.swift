@@ -17,8 +17,11 @@ class StatusManager: ObservableObject {
             NotificationCenter.default.post(name: Notification.Name("StatusChanged"), object: nil)
             
             // Sync the visual status in the League client UI so it matches
-            // what other users see via the proxy (issue #3).
-            RiotClientAPI.updateState(state)
+            // what other users see via the proxy (issue #3). Only a client we
+            // launched goes through the proxy; leave any other one alone.
+            if isClientLaunchedByApp {
+                RiotClientAPI.updateState(state)
+            }
         }
     }
     
@@ -39,8 +42,7 @@ class StatusManager: ObservableObject {
         isOffline = persistedStatus == "offline"
         logger.info("Loaded persisted status", metadata: ["status": .string(persistedStatus)])
         
-        Task { [weak self] in
-            guard let self = self else { return }
+        Task {
             var env = try Environment.detect()
             try LoggingSystem.bootstrap(from: &env)
 
@@ -104,18 +106,9 @@ class StatusManager: ObservableObject {
             resetClientLaunchedFlag()
         }
         
-        let wasRunning = isClientRunning
-        
         if status.isRunning != isClientRunning || status.launchedByApp != isClientLaunchedByApp {
             isClientRunning = status.isRunning
             isClientLaunchedByApp = status.launchedByApp
-            
-            // When the Riot Client comes online while NoChat4U is set to
-            // offline, re-sync the client-side status so it does not show
-            // "Online" after startup. Delay to let the local API initialize.
-            if !wasRunning && status.isRunning && isOffline {
-                RiotClientAPI.updateState("offline", afterDelay: 4.0)
-            }
             
             logger.info(
                 "Riot client status changed",
